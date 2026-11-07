@@ -190,9 +190,9 @@
     <string name="subscription_interval_minutes">%1$d min</string>
     <string name="subscription_interval_hours">%1$d h</string>
     <string name="subscription_interval_days">%1$d d</string>
-    <string name="subscription_interval_disabled">Disabled</string>
+    <string name="subscription_interval_disabled">Manual only</string>
     <string name="subscription_interval_zero_hint">0 disables automatic syncing</string>
-    <string name="subscription_interval_invalid">Enter 0 (disabled) or at least %1$d minutes</string>
+    <string name="subscription_interval_invalid">Enter 0 (manual only) or at least %1$d minutes</string>
     <string name="subscription_interval_needs_url">Enter a download URL to set a sync interval</string>
     <string name="subscription_min_interval">Minimum %1$d min</string>
     <string name="subscription_sync_now">Sync now</string>
@@ -890,4 +890,18 @@
     <string name="floating_expand">Expand log</string>
     <string name="floating_stop">Stop script</string>
     <string name="floating_close">Close floating window</string>
+    <string name="scripts_inspector">Layout inspector</string>
+    <string name="scripts_rename">Rename</string>
+    <string name="inspector_title">Layout inspector</string>
+    <string name="inspector_no_tree">Cannot read the node tree, enable the accessibility service first</string>
+    <string name="inspector_no_nodes">No nodes to inspect on this screen</string>
+    <string name="inspector_tap_hint">Tap a control in the screenshot to view its selector</string>
+    <string name="inspector_select_hint">Select a node to view its selector</string>
+    <string name="inspector_copy_selector">Copy selector</string>
+    <string name="inspector_copied">Selector copied</string>
+    <string name="inspector_field_id">id</string>
+    <string name="inspector_field_text">text</string>
+    <string name="inspector_field_desc">desc</string>
+    <string name="inspector_field_bounds">bounds</string>
+    <string name="settings_inspector_summary">Inspect controls and copy selectors for debugging</string>
 </resources>

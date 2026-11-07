@@ -58,6 +58,7 @@ import com.benton.izukijs.ui.common.LocalSnackbarController
 import com.benton.izukijs.ui.common.SnackbarController
 import com.benton.izukijs.ui.editor.EditorScreen
 import com.benton.izukijs.ui.hid.HidSetupScreen
+import com.benton.izukijs.ui.inspector.LayoutInspectorScreen
 import com.benton.izukijs.ui.logs.LogsScreen
 import com.benton.izukijs.ui.mcp.McpServerScreen
 import com.benton.izukijs.ui.permission.PermissionScreen
@@ -83,6 +84,7 @@ object Routes {
     const val EDITOR = "editor/{$ARG_SCRIPT_ID}"
     const val SCRIPT_EDIT = "script_edit/{$ARG_SCRIPT_ID}"
     const val SETUP = "setup"
+    const val INSPECTOR = "inspector"
     const val SCHEDULE = "schedule"
     const val HID = "hid"
     const val ADB = "adb"
@@ -255,6 +257,7 @@ private fun MainTabsHost(
         onOpenScripts = { onSelectTab(BottomItem.SCRIPTS.ordinal) },
         onOpenScript = { id -> open(Routes.editor(id)) },
         onOpenScriptEdit = { id -> open(Routes.scriptEdit(id)) },
+        onOpenInspector = { open(Routes.INSPECTOR) },
         onOpenSchedule = { open(Routes.SCHEDULE) },
         onOpenCategory = { category -> open(Routes.settingsDetail(category)) },
         onOpenAi = { open(Routes.AI) },
@@ -276,6 +279,7 @@ private fun MainTabs(
     onOpenScripts: () -> Unit,
     onOpenScript: (String) -> Unit,
     onOpenScriptEdit: (String) -> Unit,
+    onOpenInspector: () -> Unit,
     onOpenSchedule: () -> Unit,
     onOpenCategory: (SettingsCategory) -> Unit,
     onOpenAi: () -> Unit,
@@ -307,6 +311,7 @@ private fun MainTabs(
 
             BottomItem.SETTINGS -> SettingsScreen(
                 onOpenCategory = onOpenCategory,
+                onOpenInspector = onOpenInspector,
                 onOpenAi = onOpenAi,
                 onOpenMcp = onOpenMcp,
             )
@@ -416,6 +421,9 @@ private fun DetailNavHost(
                     }
                 },
             )
+        }
+        composable(Routes.INSPECTOR) {
+            LayoutInspectorScreen(onBack = { navController.popBackStack() })
         }
         composable(Routes.SCHEDULE) {
             ScheduleScreen(onBack = { navController.popBackStack() })

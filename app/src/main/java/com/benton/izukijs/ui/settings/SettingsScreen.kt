@@ -58,6 +58,7 @@ enum class SettingsCategory(val key: String, @StringRes val titleRes: Int) {
 @Composable
 fun SettingsScreen(
     onOpenCategory: (SettingsCategory) -> Unit = {},
+    onOpenInspector: () -> Unit = {},
     onOpenAi: () -> Unit = {},
     onOpenMcp: () -> Unit = {},
 ) {
@@ -103,6 +104,10 @@ fun SettingsScreen(
                         ),
                     ),
                 ) { onOpenCategory(SettingsCategory.VISION) }
+                CategoryRow(
+                    title = stringResource(R.string.inspector_title),
+                    summary = stringResource(R.string.settings_inspector_summary),
+                ) { onOpenInspector() }
             }
             Spacer(Modifier.height(16.dp))
             CategoryGroup(stringResource(R.string.settings_group_run)) {

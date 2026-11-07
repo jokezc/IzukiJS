@@ -190,9 +190,9 @@
     <string name="subscription_interval_minutes">%1$d 分钟</string>
     <string name="subscription_interval_hours">%1$d 小时</string>
     <string name="subscription_interval_days">%1$d 天</string>
-    <string name="subscription_interval_disabled">已禁用</string>
+    <string name="subscription_interval_disabled">仅手动同步</string>
     <string name="subscription_interval_zero_hint">0 表示不自动同步</string>
-    <string name="subscription_interval_invalid">请输入 0（禁用）或不小于 %1$d 的分钟数</string>
+    <string name="subscription_interval_invalid">请输入 0（仅手动）或不小于 %1$d 的分钟数</string>
     <string name="subscription_interval_needs_url">填写下载链接后可设置同步间隔</string>
     <string name="subscription_min_interval">最短 %1$d 分钟</string>
     <string name="subscription_sync_now">立即同步</string>
@@ -890,4 +890,18 @@
     <string name="floating_expand">展开日志</string>
     <string name="floating_stop">停止脚本</string>
     <string name="floating_close">关闭悬浮窗</string>
+    <string name="scripts_inspector">布局分析</string>
+    <string name="scripts_rename">重命名</string>
+    <string name="inspector_title">布局分析</string>
+    <string name="inspector_no_tree">无法读取控件树，请先开启无障碍服务</string>
+    <string name="inspector_no_nodes">当前界面没有可分析的节点</string>
+    <string name="inspector_tap_hint">点击屏幕截图中的控件查看选择器</string>
+    <string name="inspector_select_hint">选择节点查看选择器</string>
+    <string name="inspector_copy_selector">复制选择器</string>
+    <string name="inspector_copied">已复制选择器</string>
+    <string name="inspector_field_id">id</string>
+    <string name="inspector_field_text">文本</string>
+    <string name="inspector_field_desc">描述</string>
+    <string name="inspector_field_bounds">范围</string>
+    <string name="settings_inspector_summary">查看控件与选择器，辅助脚本调试</string>
 </resources>
