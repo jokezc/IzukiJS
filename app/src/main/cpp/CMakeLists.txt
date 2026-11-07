@@ -4,10 +4,6 @@ project(izuki_qjs_shim CXX)
 
 add_library(izuki_qjs_shim SHARED izuki_quickjs_shim.cpp)
 
-# Android 15+ devices may use 16 KB memory pages. Keep ELF LOAD segments
-# compatible independently of the build host's default linker page size.
-target_link_options(izuki_qjs_shim PRIVATE "-Wl,-z,max-page-size=16384")
-
 set_target_properties(
     izuki_qjs_shim
     PROPERTIES
