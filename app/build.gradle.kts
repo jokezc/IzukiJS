@@ -44,6 +44,7 @@ android {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
+            buildStagingDirectory = rootProject.layout.buildDirectory.get().asFile.resolve("cxx")
         }
     }
 
@@ -59,6 +60,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Keep the upstream release and its private scripts/settings intact.
+            applicationIdSuffix = ".lab"
+            versionNameSuffix = "-lab"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -79,7 +85,9 @@ android {
         abi {
             isEnable = true
             reset()
-            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            val labAbi = providers.gradleProperty("izukiLabAbi").orNull
+            if (labAbi == null) include("arm64-v8a", "armeabi-v7a", "x86_64")
+            else include(labAbi)
             isUniversalApk = false
         }
     }
