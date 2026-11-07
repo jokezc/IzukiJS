@@ -137,6 +137,21 @@ object HidProtocol {
 
     fun ping(): ByteArray = byteArrayOf(CMD_PING.toByte())
 
+    /** Conservative worker occupancy for legacy firmware whose PONG queues behind input. */
+    internal fun executionBudgetMs(frame: ByteArray): Long {
+        fun u16(offset: Int): Long = if (offset + 1 < frame.size)
+            ((frame[offset].toInt() and 255) or ((frame[offset + 1].toInt() and 255) shl 8)).toLong() else 0
+        return when (kind(frame)) {
+            CMD_TAP -> u16(5).let { if (it >= 65534) 100 else maxOf(20, it) + 100 }
+            CMD_SWIPE -> u16(9) + 250
+            CMD_GESTURE -> (0 until (frame.getOrNull(2)?.toInt()?.and(255) ?: 0))
+                .sumOf { u16(7 + it * 6) } + 250
+            CMD_TEXT -> u16(1) * 20 + 100
+            CMD_PING -> 0
+            else -> 100
+        }
+    }
+
     data class HandshakeAck(val version: Int, val width: Int, val height: Int)
 
     data class Status(val flags: Int) {

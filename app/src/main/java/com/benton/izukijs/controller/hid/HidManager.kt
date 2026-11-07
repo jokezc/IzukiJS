@@ -34,9 +34,7 @@ class HidManager(
             client.state.collectLatest { state ->
                 if (state == HidConnectionState.READY) {
                     controllers.register(controller)
-                    // 分辨率要等链路加密后再发：Control 特征要求 WRITE_ENC，
-                    // 刚发现服务时的写入会被拒绝，导致固件屏幕尺寸仍为 0（坐标全挤到左上角）。
-                    if (client.hidReady.value) syncResolution()
+                    // Client completes encrypted resolution setup before exposing READY.
                 } else {
                     controllers.unregister(ControlMode.HID)
                 }
@@ -48,11 +46,8 @@ class HidManager(
         scope.launch {
             client.hidReady.collect { ready ->
                 controllers.refresh()
-                if (ready) {
-                    syncResolution()
-                    // 握手帧也可能在加密前被拒，就绪后补发一次，拿回固件版本。
-                    client.send(HidProtocol.handshake())
-                }
+                // Connection setup owns the handshake. In firmware v3 it is a
+                // cancellation barrier, so never repeat it after READY.
             }
         }
 

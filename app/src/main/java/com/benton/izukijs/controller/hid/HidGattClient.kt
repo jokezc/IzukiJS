@@ -65,49 +65,25 @@ class HidGattClient(
     val protocolVersion: Int get() = _protocolVersion
 
     /** 固件是否支持 CMD_GESTURE（复杂轨迹 / 停顿）。 */
-    fun supportsGesture(): Boolean = _protocolVersion >= HidProtocol.MIN_GESTURE_VERSION
+    fun supportsGesture(): Boolean = _protocolVersion >= HidProtocol.MIN_GESTURE_VERSION && maxPayload >= 15
 
     private val handler = Handler(Looper.getMainLooper())
 
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var controlChar: BluetoothGattCharacteristic? = null
+    @Volatile private var bluetoothGatt: BluetoothGatt? = null
+    @Volatile private var controlChar: BluetoothGattCharacteristic? = null
     private var eventChar: BluetoothGattCharacteristic? = null
 
-    /** Android GATT 同时只允许一个操作在途；控制帧全部排队，逐个等回调再发，避免丢帧。 */
-    private val pendingWrites = ArrayDeque<ByteArray>()
-    private var writeInFlight = false
+    private val link = HidLinkState()
     private var cccdWriteInFlight = false
-
-    /** Event CCCD 是否已订阅成功（决定能否收到固件的 STATUS / HANDSHAKE_ACK）。 */
-    @Volatile
     private var eventSubscribed = false
-
-    /** 最近一次尝试订阅 Event 的时刻，用于失败后的重试节流。 */
-    @Volatile
-    private var lastSubscribeTry = 0L
-
-    /** 服务发现是否已完成一次；用于忽略重复/缓存触发的 discoverServices 回调。 */
-    @Volatile
     private var servicesDiscovered = false
-
-    /** 是否有一次服务发现正在进行，避免重复 discoverServices 造成 GATT 命令冲突。 */
-    @Volatile
     private var discoveryInFlight = false
-
-    /** 连续订阅失败次数；超过阈值就彻底重连，避免本地 GATT 客户端卡死。 */
-    private var subscribeFailures = 0
-
-    /** 订阅 Event 的延迟任务（放到服务发现回调之外执行，避开栈内待处理命令冲突）。 */
-    private val subscribeRunnable = Runnable { subscribeEvent() }
-
-    /** 订阅超时兜底：若 CCCD 写入回调始终不返回，主动失败重试或重连。 */
-    private val subscribeTimeout = Runnable {
-        if (!eventSubscribed) {
-            logBus.warn("HID 事件订阅超时，重试")
-            synchronized(pendingWrites) { cccdWriteInFlight = false }
-            onSubscribeFailed()
-        }
-    }
+    private var handshakeReceived = false
+    private var resolutionPending = false
+    private var resolutionConfigured = false
+    private var initializationDeadline = 0L
+    @Volatile private var negotiatedMtu = 23
+    val maxPayload: Int get() = minOf(260, negotiatedMtu - 3)
 
     /** 是否开启自动重连（连接过 / 记忆了设备后为 true）。看门狗据此保持重试。 */
     private val _autoReconnect = MutableStateFlow(false)
@@ -125,7 +101,8 @@ class HidGattClient(
     @Volatile
     private var userScanning = false
 
-    private val scanTimeout = Runnable { stopScan() }
+    private var scanGeneration = 0L
+    private var activeScanCallback: ScanCallback? = null
 
     /** 按地址去重的扫描结果，仅在节流窗口结束后发布，避免每个广播包都重建并排序列表。 */
     private val discovered = LinkedHashMap<String, HidDevice>()
@@ -151,7 +128,7 @@ class HidGattClient(
     private var connectingSince = 0L
 
     val isReady: Boolean get() =
-        _state.value == HidConnectionState.READY && _hidReady.value
+        _state.value == HidConnectionState.READY && _hidReady.value && link.fault == null && bluetoothGatt != null
 
     // ---- 权限 ----
 
@@ -170,39 +147,43 @@ class HidGattClient(
     // ---- 扫描 ----
 
     @SuppressLint("MissingPermission")
-    fun startScan() {
+    fun startScan() = onMain {
+        if (bluetoothGatt != null) {
+            logBus.warn("请先断开当前HID连接再扫描")
+            return@onMain
+        }
         val scanner = adapter?.bluetoothLeScanner
         if (scanner == null || !hasPermissions()) {
             logBus.warn("无法扫描：蓝牙未开启或缺权限")
-            return
+            return@onMain
         }
-        handler.removeCallbacks(publishDevices)
-        publishScheduled = false
+        stopScan()
         synchronized(discovered) { discovered.clear() }
         _devices.value = emptyList()
         addBondedDevices()
+        val generation = ++scanGeneration
+        val callback = scanCallback(generation)
+        activeScanCallback = callback
         _state.value = HidConnectionState.SCANNING
         userScanning = true
-        // 不带服务 UUID 过滤：部分机型/控制器对 128 位 UUID 的硬件过滤匹配不可靠，
-        // 会导致系统能扫到、App 却收不到结果。改为在回调里自行匹配。
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-        runCatching { scanner.startScan(null, settings, scanCallback) }
-            .onFailure { logBus.error("扫描失败: ${it.message}") }
-        handler.removeCallbacks(scanTimeout)
-        handler.postDelayed(scanTimeout, SCAN_TIMEOUT_MS)
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        runCatching { scanner.startScan(null, settings, callback) }.onFailure {
+            logBus.error("扫描失败: ${it.javaClass.simpleName}")
+            stopScan()
+        }
+        handler.postDelayed({ if (scanGeneration == generation) stopScan() }, SCAN_TIMEOUT_MS)
     }
 
     @SuppressLint("MissingPermission")
-    fun stopScan() {
-        handler.removeCallbacks(scanTimeout)
+    fun stopScan() = onMain {
+        val old = activeScanCallback
+        activeScanCallback = null
+        scanGeneration++
         userScanning = false
-        if (!hasPermissions()) return
-        runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
-        if (_state.value == HidConnectionState.SCANNING) {
-            _state.value = HidConnectionState.IDLE
-        }
+        handler.removeCallbacks(publishDevices)
+        publishScheduled = false
+        if (hasPermissions() && old != null) runCatching { adapter?.bluetoothLeScanner?.stopScan(old) }
+        if (_state.value == HidConnectionState.SCANNING) _state.value = HidConnectionState.IDLE
     }
 
     /** 已配对过的狗即使当前没在广播（被系统 HID 主机占用连接）也能直接连接。 */
@@ -224,27 +205,23 @@ class HidGattClient(
         publishDevices.run()
     }
 
-    private val scanCallback = object : ScanCallback() {
+    private fun scanCallback(generation: Long) = object : ScanCallback() {
         @SuppressLint("MissingPermission")
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device ?: return
+        override fun onScanResult(callbackType: Int, result: ScanResult) = onMain {
+            if (generation != scanGeneration || !userScanning || _state.value != HidConnectionState.SCANNING) return@onMain
+            val device = result.device ?: return@onMain
             val name = runCatching { device.name }.getOrNull() ?: "未知设备"
-            val record = result.scanRecord
-            val uuidMatch = record?.serviceUuids
-                ?.any { it.uuid == HidProtocol.SERVICE_UUID } == true
-            val nameMatch = name.startsWith(DEVICE_NAME_PREFIX, ignoreCase = true)
-            if (!uuidMatch && !nameMatch) return
-            synchronized(discovered) {
-                discovered[device.address] = HidDevice(name, device.address, result.rssi)
-            }
+            val matches = result.scanRecord?.serviceUuids?.any { it.uuid == HidProtocol.SERVICE_UUID } == true ||
+                name.startsWith(DEVICE_NAME_PREFIX, ignoreCase = true)
+            if (!matches) return@onMain
+            synchronized(discovered) { discovered[device.address] = HidDevice(name, device.address, result.rssi) }
             schedulePublish()
         }
 
-        override fun onScanFailed(errorCode: Int) {
+        override fun onScanFailed(errorCode: Int) = onMain {
+            if (generation != scanGeneration || !userScanning) return@onMain
             logBus.error("扫描失败，错误码 $errorCode")
-            handler.removeCallbacks(scanTimeout)
-            userScanning = false
-            _state.value = HidConnectionState.IDLE
+            stopScan()
         }
     }
 
@@ -254,472 +231,380 @@ class HidGattClient(
         handler.postDelayed(publishDevices, PUBLISH_THROTTLE_MS)
     }
 
-    // ---- 连接 ----
+    // All Android GATT state transitions run on the main looper. Queue admission
+    // is synchronized separately and carries the session it was admitted under.
+    private fun onMain(action: () -> Unit) {
+        if (Looper.myLooper() == handler.looper) action() else handler.post { action() }
+    }
 
-    /** 用户主动连接：清除「重连中」提示，走正常连接流程。 */
-    fun connect(address: String) {
+    private fun later(epoch: Long, delayMs: Long, action: () -> Unit) {
+        handler.postDelayed({ if (link.session == epoch) action() }, delayMs)
+    }
+
+    private fun fromGatt(epoch: Long, gatt: BluetoothGatt, action: () -> Unit) {
+        handler.post {
+            if (link.session == epoch && bluetoothGatt === gatt) action()
+            else logBus.debug("HID 忽略旧连接回调 session=$epoch")
+        }
+    }
+
+    fun connect(address: String) = onMain {
         _reconnecting.value = false
         startConnect(address)
     }
 
     @SuppressLint("MissingPermission")
     private fun startConnect(address: String) {
-        if (!hasPermissions()) {
-            logBus.warn("缺少蓝牙权限")
-            return
-        }
-        // 蓝牙未开启时不发起 connectGatt（会抛异常并进入重试刷屏），置 IDLE 等看门狗下次再试。
-        if (!isBluetoothEnabled()) {
-            if (!retryLogged) {
-                logBus.warn("蓝牙未开启，等待重连 HID")
-                retryLogged = true
-            } else {
-                logBus.debug("蓝牙仍未开启，继续等待重连")
-            }
+        if (!hasPermissions() || !isBluetoothEnabled()) {
+            closeGatt()
             _state.value = HidConnectionState.IDLE
             return
         }
         val device = runCatching { adapter?.getRemoteDevice(address) }.getOrNull() ?: return
+        closeGatt()
         _autoReconnect.value = true
         lastAddress = address
         stopScan()
         connectingSince = SystemClock.elapsedRealtime()
+        initializationDeadline = connectingSince + CONNECT_TIMEOUT_MS
         _state.value = HidConnectionState.CONNECTING
-        handler.removeCallbacks(subscribeRunnable)
-        handler.removeCallbacks(subscribeTimeout)
-        eventSubscribed = false
-        servicesDiscovered = false
-        discoveryInFlight = false
+        val epoch = link.session
         runCatching {
-            bluetoothGatt?.close()
-            bluetoothGatt = null
-            bluetoothGatt = device.connectGatt(
-                context,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE,
-            )
-        }.onFailure {
-            // 不保留已 close 的旧实例，置 ERROR 让看门狗下一轮重新发起。
-            bluetoothGatt = null
-            _state.value = HidConnectionState.ERROR
-            if (!retryLogged) {
-                logBus.error("连接失败: ${it.message}")
-                retryLogged = true
-            } else {
-                logBus.debug("连接失败: ${it.message}")
-            }
+            bluetoothGatt = device.connectGatt(context, false, callback(epoch), BluetoothDevice.TRANSPORT_LE)
+            if (bluetoothGatt == null) failLink("connect_rejected")
+        }.onFailure { failLink("connect_exception:${it.javaClass.simpleName}") }
+        later(epoch, CONNECT_TIMEOUT_MS) {
+            if (!isReady && initializationDeadline != 0L) failLink("initialization_timeout")
         }
     }
 
-    fun disconnect() {
+    fun disconnect() = onMain {
         _autoReconnect.value = false
         lastAddress = null
         _reconnecting.value = false
-        retryLogged = false
         closeGatt()
         _state.value = HidConnectionState.IDLE
-        _connectedAddress.value = null
     }
 
-    /** 自动重连：仅当之前连接成功过。 */
-    @SuppressLint("MissingPermission")
-    fun reconnectIfNeeded() {
-        if (userScanning) {
-            handler.postDelayed({ reconnectIfNeeded() }, RECONNECT_DELAY_MS)
-            return
+    fun reconnectIfNeeded() = onMain {
+        if (!userScanning && _autoReconnect.value && bluetoothGatt == null) {
+            lastAddress?.let { _reconnecting.value = true; startConnect(it) }
         }
-        val address = lastAddress ?: return
-        if (!hasPermissions()) return
-        _reconnecting.value = true
-        startConnect(address)
     }
 
-    fun setLastAddress(address: String?) {
+    fun setLastAddress(address: String?) = onMain {
         lastAddress = address
-        if (address != null) _autoReconnect.value = true
+        _autoReconnect.value = address != null
     }
 
-    /**
-     * 看门狗调用：确保已记忆的设备保持连接。狗刚通电、或连接回调丢失时，
-     * 主动发起/重试连接；连接长时间卡住则强制重连。
-     */
-    fun ensureConnected() {
-        val address = lastAddress ?: return
-        if (!_autoReconnect.value || userScanning || !hasPermissions()) return
+    fun ensureConnected() = onMain {
+        if (!_autoReconnect.value || userScanning) return@onMain
+        if (!hasPermissions() || !isBluetoothEnabled()) {
+            if (bluetoothGatt != null) closeGatt()
+            _state.value = HidConnectionState.IDLE
+            return@onMain
+        }
+        val now = SystemClock.elapsedRealtime()
+        val fault = link.check(now)
+        if (fault != null) { failLink(fault); return@onMain }
         when (_state.value) {
-            HidConnectionState.IDLE, HidConnectionState.ERROR -> {
-                _reconnecting.value = true
-                startConnect(address)
+            HidConnectionState.IDLE, HidConnectionState.ERROR -> lastAddress?.let { startConnect(it) }
+            HidConnectionState.CONNECTING, HidConnectionState.CONNECTED -> {
+                if (initializationDeadline != 0L && now >= initializationDeadline) failLink("initialization_timeout")
             }
-            HidConnectionState.CONNECTING -> {
-                val elapsed = SystemClock.elapsedRealtime() - connectingSince
-                if (elapsed > CONNECT_TIMEOUT_MS) {
-                    // 一轮掉线周期只告警一次，后续重试降级为 DEBUG，避免日志刷屏。
-                    if (!retryLogged) {
-                        logBus.warn("HID 连接超时，重新连接")
-                        retryLogged = true
-                    } else {
-                        logBus.debug("HID 连接仍超时，继续重连")
-                    }
-                    closeGatt()
-                    _reconnecting.value = true
-                    startConnect(address)
+            HidConnectionState.READY -> {
+                val realtime = protocolVersion >= 3
+                if (link.shouldProbe(now, realtime)) {
+                    val epoch = link.session
+                    if (link.enqueueProbe(epoch, now, realtime)) drainWrites(epoch)
                 }
             }
-            HidConnectionState.READY, HidConnectionState.CONNECTED -> ensureSubscribed()
             else -> Unit
         }
     }
 
-    /** 看门狗调用：服务发现完成后若仍未订阅 Event，补订阅一次（失败会自行重试）。 */
-    private fun ensureSubscribed() {
-        if (eventSubscribed || !servicesDiscovered) return
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastSubscribeTry < SUBSCRIBE_RETRY_MS) return
-        lastSubscribeTry = now
-        scheduleSubscribe(0L)
+    @SuppressLint("MissingPermission")
+    private fun discover(gatt: BluetoothGatt) {
+        if (servicesDiscovered || discoveryInFlight) return
+        discoveryInFlight = true
+        if (!runCatching { gatt.discoverServices() }.getOrDefault(false)) failLink("discovery_rejected")
     }
 
-    /** 把订阅动作延迟到当前回调之外（下一主线程 tick 或指定延时），避开栈内待处理命令。 */
-    private fun scheduleSubscribe(delayMs: Long) {
-        handler.removeCallbacks(subscribeRunnable)
-        if (delayMs <= 0L) handler.post(subscribeRunnable)
-        else handler.postDelayed(subscribeRunnable, delayMs)
-    }
-
-    /**
-     * 订阅 Event 的 CCCD。Android GATT 同一时刻只允许一个操作在途，因此写入 CCCD 前
-     * 必须确认没有控制帧写入在进行；启动后由 [onDescriptorWrite] 或 [subscribeTimeout]
-     * 决定成功还是重试/重连。
-     */
     @SuppressLint("MissingPermission")
     private fun subscribeEvent() {
-        if (eventSubscribed) return
+        if (eventSubscribed || cccdWriteInFlight) return
         val gatt = bluetoothGatt ?: return
         val event = eventChar ?: return
-        if (!hasPermissions()) return
-        synchronized(pendingWrites) {
-            if (writeInFlight || cccdWriteInFlight) {
-                // 控制帧占用着 GATT 操作槽，稍后再订阅。
-                scheduleSubscribe(SUBSCRIBE_RETRY_MS)
-                return
-            }
-            cccdWriteInFlight = true
+        val descriptor = event.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
+        if (descriptor == null || !gatt.setCharacteristicNotification(event, true)) {
+            failLink("subscription_unavailable"); return
         }
+        cccdWriteInFlight = true
         val started = runCatching {
-            gatt.setCharacteristicNotification(event, true)
-            val cccd = event.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
-            if (cccd == null) {
-                false
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
-                    BluetoothStatusCodes.SUCCESS
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
-                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 @Suppress("DEPRECATION")
-                gatt.writeDescriptor(cccd)
+                gatt.writeDescriptor(descriptor)
             }
         }.getOrDefault(false)
-        if (!started) {
-            synchronized(pendingWrites) { cccdWriteInFlight = false }
-            onSubscribeFailed()
-        } else {
-            handler.removeCallbacks(subscribeTimeout)
-            handler.postDelayed(subscribeTimeout, SUBSCRIBE_TIMEOUT_MS)
+        if (!started) { failLink("subscription_rejected"); return }
+        later(link.session, SUBSCRIBE_TIMEOUT_MS) {
+            if (cccdWriteInFlight) failLink("subscription_timeout")
         }
     }
 
-    /** 订阅失败：小步重试，连续失败多次则彻底重连以清掉卡死的本地 GATT 客户端。 */
-    private fun onSubscribeFailed() {
-        if (eventSubscribed) return
-        subscribeFailures++
-        if (subscribeFailures >= MAX_SUBSCRIBE_FAILURES) {
-            logBus.warn("HID 事件订阅多次失败，重连设备")
-            forceReconnect()
-        } else {
-            scheduleSubscribe(SUBSCRIBE_RETRY_MS)
+    private fun updateReady() {
+        if (servicesDiscovered && eventSubscribed && handshakeReceived && _hidReady.value) {
+            // Initialization must enter the firmware FIFO before business input.
+            if (!resolutionConfigured) {
+                if (!resolutionPending) {
+                    val metrics = context.resources.displayMetrics
+                    resolutionPending = true
+                    if (!sendInternal(HidProtocol.setResolution(metrics.widthPixels, metrics.heightPixels))) {
+                        failLink("resolution_setup_rejected")
+                    }
+                }
+                return
+            }
+            initializationDeadline = 0
+            if (_state.value != HidConnectionState.READY) logBus.success("HID 会话就绪 session=${link.session}（输入执行须另行核对）")
+            _state.value = HidConnectionState.READY
+            _reconnecting.value = false
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun forceReconnect() {
-        val address = lastAddress ?: return
-        subscribeFailures = 0
+    private fun failLink(reason: String) {
+        logBus.error("HID_TRANSPORT_FAULT session=${link.session} reason=$reason；撤销就绪，丢弃待发命令，不重放输入")
+        link.fail(reason)
+        val address = lastAddress
         closeGatt()
-        _connectedAddress.value = null
-        if (!_autoReconnect.value) {
-            _state.value = HidConnectionState.IDLE
-            _reconnecting.value = false
-            return
+        _state.value = HidConnectionState.ERROR
+        _reconnecting.value = _autoReconnect.value
+        val epoch = link.session
+        if (_autoReconnect.value && address != null) later(epoch, RECONNECT_DELAY_MS) {
+            if (_autoReconnect.value && !userScanning && lastAddress == address) startConnect(address)
         }
-        _state.value = HidConnectionState.CONNECTING
-        connectingSince = SystemClock.elapsedRealtime()
-        _reconnecting.value = true
-        handler.postDelayed({ if (_autoReconnect.value) startConnect(address) }, RECONNECT_DELAY_MS)
     }
 
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
-        handler.removeCallbacks(subscribeRunnable)
-        handler.removeCallbacks(subscribeTimeout)
-        runCatching { bluetoothGatt?.disconnect() }
-        runCatching { bluetoothGatt?.close() }
+        val old = bluetoothGatt
+        // Invalidate before disconnect: even a synchronous old callback is stale.
         bluetoothGatt = null
-        controlChar = null
-        eventChar = null
-        eventSubscribed = false
-        servicesDiscovered = false
-        discoveryInFlight = false
-        _hidReady.value = false
-        _protocolVersion = 0
-        synchronized(pendingWrites) {
-            pendingWrites.clear()
-            writeInFlight = false
-            cccdWriteInFlight = false
-        }
+        link.reset(SystemClock.elapsedRealtime())
+        controlChar = null; eventChar = null
+        eventSubscribed = false; servicesDiscovered = false; discoveryInFlight = false
+        cccdWriteInFlight = false; handshakeReceived = false
+        resolutionPending = false; resolutionConfigured = false
+        initializationDeadline = 0; negotiatedMtu = 23
+        _hidReady.value = false; _protocolVersion = 0
+        _dongleResolution.value = null; _connectedAddress.value = null
+        runCatching { old?.disconnect() }
+        runCatching { old?.close() }
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
+    private fun callback(epoch: Long) = object : BluetoothGattCallback() {
+        override fun onServiceChanged(gatt: BluetoothGatt) = fromGatt(epoch, gatt) {
+            failLink("services_changed")
+        }
+
         @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) = fromGatt(epoch, gatt) {
+            if (status != BluetoothGatt.GATT_SUCCESS) { failLink("connection_status:$status"); return@fromGatt }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    disconnectLogged = false
-                    retryLogged = false
-                    _reconnecting.value = false
+                    if (_state.value != HidConnectionState.CONNECTING) return@fromGatt
                     _state.value = HidConnectionState.CONNECTED
                     _connectedAddress.value = gatt.device.address
-                    _hidReady.value = false
-                    _protocolVersion = 0
-                    eventSubscribed = false
-                    lastSubscribeTry = 0L
-                    servicesDiscovered = false
-                    discoveryInFlight = false
-                    subscribeFailures = 0
-                    handler.removeCallbacks(subscribeRunnable)
-                    handler.removeCallbacks(subscribeTimeout)
-                    synchronized(pendingWrites) {
-                        pendingWrites.clear()
-                        writeInFlight = false
-                        cccdWriteInFlight = false
-                    }
-                    logBus.info("HID 狗已连接，协商 MTU…")
-                    // 先请求 MTU，服务发现放到 onMtuChanged 里，避免同时占用 GATT 操作槽。
-                    runCatching { gatt.requestMtu(517) }
+                    logBus.info("HID GATT已连接 session=$epoch，协商MTU")
+                    if (!runCatching { gatt.requestMtu(517) }.getOrDefault(false)) discover(gatt)
+                    // A lost MTU callback must not strand the CONNECTED state.
+                    later(epoch, MTU_TIMEOUT_MS) { if (!servicesDiscovered && !discoveryInFlight) discover(gatt) }
                 }
-
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    if (!disconnectLogged) {
-                        logBus.warn("HID 狗连接断开")
-                        disconnectLogged = true
-                    }
-                    closeGatt()
-                    _connectedAddress.value = null
-                    if (_autoReconnect.value && lastAddress != null) {
-                        _state.value = HidConnectionState.CONNECTING
-                        _reconnecting.value = true
-                        handler.postDelayed({ reconnectIfNeeded() }, RECONNECT_DELAY_MS)
-                    } else {
-                        _state.value = HidConnectionState.IDLE
-                        _reconnecting.value = false
-                    }
-                }
+                BluetoothProfile.STATE_DISCONNECTED -> failLink("disconnected")
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) = fromGatt(epoch, gatt) {
+            if (status == BluetoothGatt.GATT_SUCCESS) negotiatedMtu = mtu.coerceAtLeast(23)
+            discover(gatt)
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) = fromGatt(epoch, gatt) {
             discoveryInFlight = false
-            // 已连接的设备服务来自缓存，discoverServices 可能被重复触发；只处理第一次。
-            if (servicesDiscovered) return
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                logBus.error("服务发现失败: $status")
-                _state.value = HidConnectionState.ERROR
-                return
-            }
+            if (servicesDiscovered) return@fromGatt
+            if (status != BluetoothGatt.GATT_SUCCESS) { failLink("discovery_status:$status"); return@fromGatt }
             val service = gatt.getService(HidProtocol.SERVICE_UUID)
-            if (service == null) {
-                logBus.error("未找到 HID 控制服务")
-                _state.value = HidConnectionState.ERROR
-                return
-            }
-            controlChar = service.getCharacteristic(HidProtocol.CONTROL_UUID)
-            eventChar = service.getCharacteristic(HidProtocol.EVENT_UUID)
-            if (controlChar == null || eventChar == null) {
-                logBus.error("HID 控制/事件特征缺失")
-                _state.value = HidConnectionState.ERROR
-                return
+            controlChar = service?.getCharacteristic(HidProtocol.CONTROL_UUID)
+            eventChar = service?.getCharacteristic(HidProtocol.EVENT_UUID)
+            if (controlChar == null || eventChar == null) { failLink("missing_characteristic"); return@fromGatt }
+            if ((controlChar!!.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) == 0) {
+                failLink("write_response_unsupported"); return@fromGatt
             }
             servicesDiscovered = true
-            _state.value = HidConnectionState.READY
-            logBus.success("HID 狗已连接，订阅事件通道…")
-            // 关键：不要在 discoverServices 的回调栈内立刻写 CCCD。重连时服务来自缓存，
-            // 发现回调几乎与请求同步返回，此时蓝牙栈内仍有未清理的发现命令，直接写
-            // CCCD 会被拒绝（bta_gattc_enqueue: already has a pending command），
-            // 之后回调不再返回，Event 永远订阅不上 → HID 一直"未就绪"。
-            scheduleSubscribe(SUBSCRIBE_DELAY_MS)
+            later(epoch, 150) { subscribeEvent() }
         }
 
         @Deprecated("Deprecated in Java")
-        @SuppressLint("MissingPermission")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-        ) {
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             @Suppress("DEPRECATION")
-            handleEvent(characteristic.value ?: return)
+            val value = characteristic.value?.copyOf() ?: return
+            if (characteristic.uuid == HidProtocol.EVENT_UUID) fromGatt(epoch, gatt) { handleEvent(value) }
         }
 
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-        ) {
-            handleEvent(value)
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            val copy = value.copyOf()
+            if (characteristic.uuid == HidProtocol.EVENT_UUID) fromGatt(epoch, gatt) { handleEvent(copy) }
         }
 
-        @SuppressLint("MissingPermission")
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            // 部分机型会重复回调 onMtuChanged；只发起一次服务发现，避免 GATT 命令冲突。
-            if (servicesDiscovered || discoveryInFlight) return
-            discoveryInFlight = true
-            runCatching { gatt.discoverServices() }
-                .onFailure {
-                    discoveryInFlight = false
-                    logBus.error("服务发现失败: ${it.message}")
-                }
-        }
-
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int,
-        ) {
-            synchronized(pendingWrites) { writeInFlight = false }
-            drainWrites()
-        }
-
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt,
-            descriptor: BluetoothGattDescriptor,
-            status: Int,
-        ) {
-            handler.removeCallbacks(subscribeTimeout)
-            synchronized(pendingWrites) { cccdWriteInFlight = false }
-            if (descriptor.uuid == CLIENT_CHARACTERISTIC_CONFIG) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    eventSubscribed = true
-                    subscribeFailures = 0
-                    logBus.info("HID 事件通道已订阅")
-                    // 订阅成功后再握手，确保 HANDSHAKE_ACK / STATUS 能被收到。
-                    send(HidProtocol.handshake())
-                } else {
-                    logBus.warn("HID 事件订阅被拒: $status")
-                    onSubscribeFailed()
-                }
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) = fromGatt(epoch, gatt) {
+            if (characteristic.uuid != HidProtocol.CONTROL_UUID) return@fromGatt
+            val write = link.inFlight ?: return@fromGatt
+            if (!link.complete(epoch, write.id, status == BluetoothGatt.GATT_SUCCESS, "write_status:$status")) return@fromGatt
+            if (status != BluetoothGatt.GATT_SUCCESS) { failLink("write_status:$status id=${write.id}"); return@fromGatt }
+            if (resolutionPending && write.payload.firstOrNull()?.toInt() == HidProtocol.CMD_SET_RESOLUTION) {
+                resolutionPending = false
+                resolutionConfigured = true
+                updateReady()
             }
-            drainWrites()
+            logBus.debug("HID_TX_TRANSPORT_COMPLETE session=$epoch id=${write.id}（非输入执行确认）")
+            drainWrites(epoch)
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) = fromGatt(epoch, gatt) {
+            if (descriptor.uuid != CLIENT_CHARACTERISTIC_CONFIG || descriptor.characteristic.uuid != HidProtocol.EVENT_UUID || !cccdWriteInFlight) return@fromGatt
+            cccdWriteInFlight = false
+            if (status != BluetoothGatt.GATT_SUCCESS) { failLink("subscription_status:$status"); return@fromGatt }
+            eventSubscribed = true
+            logBus.info("HID 事件通道已订阅 session=$epoch")
+            sendInternal(HidProtocol.handshake())
         }
     }
 
     private fun handleEvent(data: ByteArray) {
         when (HidProtocol.kind(data)) {
-            HidProtocol.EVT_HANDSHAKE_ACK -> {
-                HidProtocol.parseHandshakeAck(data)?.let {
-                    _protocolVersion = it.version
-                    _dongleResolution.value = it.width to it.height
-                    logBus.info("HID 狗 v${it.version}，数位板 ${it.width}x${it.height}")
-                }
+            HidProtocol.EVT_HANDSHAKE_ACK -> HidProtocol.parseHandshakeAck(data)?.let {
+                _protocolVersion = it.version
+                _dongleResolution.value = it.width to it.height
+                handshakeReceived = true
+                logBus.info("HID 固件v${it.version}，数位板 ${it.width}x${it.height}")
+                updateReady()
             }
-
-            HidProtocol.EVT_STATUS -> {
-                HidProtocol.parseStatus(data)?.let {
-                    _hidReady.value = it.hidReady
-                    logBus.info(
-                        "HID 状态: 链路=${it.linkUp} 加密=${it.encrypted} " +
-                            "HID就绪=${it.hidReady} App=${it.appReady}",
-                    )
-                }
+            HidProtocol.EVT_STATUS -> HidProtocol.parseStatus(data)?.let {
+                val ready = it.linkUp && it.encrypted && it.hidReady
+                if (isReady && !ready) { failLink("firmware_not_ready"); return }
+                _hidReady.value = ready
+                logBus.info("HID 状态: 链路=${it.linkUp} 加密=${it.encrypted} HID就绪=$ready App=${it.appReady}")
+                updateReady()
             }
-
-            HidProtocol.EVT_ERROR -> {
-                val code = HidProtocol.parseError(data)
-                logBus.warn("HID 狗返回错误: ${code?.let { HidProtocol.errorText(it) } ?: "未知"}")
+            HidProtocol.EVT_PONG -> if (data.size == 1) {
+                link.pong(SystemClock.elapsedRealtime())
+                logBus.debug("HID_HEARTBEAT_PONG session=${link.session}")
             }
-            else -> Unit
+            HidProtocol.EVT_ERROR -> HidProtocol.parseError(data)?.let { failLink("firmware_error:$it ${HidProtocol.errorText(it)}") }
         }
     }
 
-    // ---- 下发 ----
+    /** true means accepted into this session's bounded queue, never execution success. */
+    fun send(payload: ByteArray): Boolean = sendBatch(listOf(payload))
 
-    /** 入队一帧控制数据。返回 true 表示已接受（并不代表已发送成功）。 */
-    fun send(payload: ByteArray): Boolean {
-        if (bluetoothGatt == null || controlChar == null || !hasPermissions()) return false
-        synchronized(pendingWrites) {
-            if (pendingWrites.size >= MAX_PENDING_WRITES) {
-                logBus.warn("HID 发送队列已满，丢弃一帧")
-                return false
-            }
-            pendingWrites.addLast(payload)
-        }
-        drainWrites()
+    fun sendBatch(frames: List<ByteArray>): Boolean {
+        val epoch = link.session
+        if (!isReady || !hasPermissions() || frames.isEmpty() || frames.any { it.isEmpty() || it.size > maxPayload }) return false
+        val now = SystemClock.elapsedRealtime()
+        if (link.check(now) != null) { onMain { if (link.session == epoch) failLink(link.fault ?: "expired") }; return false }
+        if (!link.enqueue(epoch, frames, now)) return false
+        scheduleAdmittedBatch(epoch, frames.size)
         return true
     }
 
+    /** Explicit transport receipt. No firmware execution acknowledgement is implied. */
+    fun submitBatch(frames: List<ByteArray>): HidBatchReceipt {
+        val epoch = link.session
+        val rejection = when {
+            !isReady -> "not_ready"
+            !hasPermissions() -> "missing_permission"
+            frames.any { it.isEmpty() || it.size > maxPayload } -> "invalid_payload"
+            else -> null
+        }
+        if (rejection != null) return link.reject(epoch, frames.size, rejection)
+        val now = SystemClock.elapsedRealtime()
+        if (link.check(now) != null) {
+            onMain { if (link.session == epoch) failLink(link.fault ?: "expired") }
+        }
+        val receipt = link.submit(epoch, frames, now)
+        if (receipt.accepted) scheduleAdmittedBatch(epoch, frames.size, receipt.id)
+        return receipt
+    }
+
+    fun rejectBatch(frameCount: Int, reason: String): HidBatchReceipt =
+        link.reject(link.session, frameCount, reason)
+
+    fun receipt(id: String): HidBatchReceipt? {
+        val epoch = link.session
+        link.check(SystemClock.elapsedRealtime())?.let { fault ->
+            onMain { if (link.session == epoch) failLink(fault) }
+        }
+        return link.receipt(id)
+    }
+
+    private fun scheduleAdmittedBatch(epoch: Long, frameCount: Int, batchId: String? = null) {
+        logBus.debug("HID_TX_ACCEPTED session=$epoch frames=$frameCount batch=${batchId ?: "untracked"}（仅入队）")
+        onMain { if (link.session == epoch) drainWrites(epoch) }
+        later(epoch, WRITE_TIMEOUT_MS) { link.check(SystemClock.elapsedRealtime())?.let { failLink(it) } }
+    }
+
+    private fun sendInternal(payload: ByteArray): Boolean {
+        val epoch = link.session
+        if (bluetoothGatt == null || !eventSubscribed || !link.enqueue(epoch, listOf(payload), SystemClock.elapsedRealtime())) return false
+        drainWrites(epoch)
+        return link.session == epoch
+    }
+
     @SuppressLint("MissingPermission")
-    private fun drainWrites() {
+    private fun drainWrites(epoch: Long) {
+        if (link.session != epoch || cccdWriteInFlight) return
+        val fault = link.check(SystemClock.elapsedRealtime())
+        if (fault != null) { failLink(fault); return }
         val gatt = bluetoothGatt ?: return
         val control = controlChar ?: return
-        if (!hasPermissions()) return
-        val payload: ByteArray
-        synchronized(pendingWrites) {
-            if (writeInFlight || cccdWriteInFlight) return
-            writeInFlight = true
-            payload = pendingWrites.pollFirst() ?: run {
-                writeInFlight = false
-                return
-            }
-        }
+        val write = link.take(SystemClock.elapsedRealtime()) ?: return
         val ok = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(
-                    control,
-                    payload,
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
-                ) == BluetoothStatusCodes.SUCCESS
+                gatt.writeCharacteristic(control, write.payload, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
             } else {
                 @Suppress("DEPRECATION")
-                control.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                control.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 @Suppress("DEPRECATION")
-                control.value = payload
+                control.value = write.payload
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(control)
             }
         }.getOrDefault(false)
-        if (!ok) {
-            // GATT 忙：放回队首，稍后重试。
-            synchronized(pendingWrites) {
-                writeInFlight = false
-                pendingWrites.addFirst(payload)
-            }
-            handler.postDelayed({ drainWrites() }, WRITE_RETRY_DELAY_MS)
+        if (!ok) { link.complete(epoch, write.id, false, "write_rejected"); failLink("write_rejected id=${write.id}"); return }
+        write.realtimeProbe?.let { realtime ->
+            link.probeSent(SystemClock.elapsedRealtime(), realtime)
+            later(epoch, HEARTBEAT_TIMEOUT_MS) { link.check(SystemClock.elapsedRealtime())?.let { failLink(it) } }
+        }
+        later(epoch, WRITE_TIMEOUT_MS) {
+            if (link.inFlight?.id == write.id) link.check(SystemClock.elapsedRealtime())?.let { failLink(it) }
         }
     }
 
     companion object {
-        private val CLIENT_CHARACTERISTIC_CONFIG: UUID =
-            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private const val RECONNECT_DELAY_MS = 2000L
+        private val CLIENT_CHARACTERISTIC_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val RECONNECT_DELAY_MS = 2_000L
         private const val CONNECT_TIMEOUT_MS = 15_000L
-        private const val SUBSCRIBE_RETRY_MS = 2000L
-        private const val SUBSCRIBE_DELAY_MS = 150L
-        private const val SUBSCRIBE_TIMEOUT_MS = 1500L
-        private const val MAX_SUBSCRIBE_FAILURES = 3
+        private const val MTU_TIMEOUT_MS = 3_000L
+        private const val SUBSCRIBE_TIMEOUT_MS = 1_500L
+        private const val WRITE_TIMEOUT_MS = 2_000L
+        private const val HEARTBEAT_TIMEOUT_MS = 5_000L
         private const val SCAN_TIMEOUT_MS = 20_000L
         private const val PUBLISH_THROTTLE_MS = 400L
         private const val DEVICE_NAME_PREFIX = "Izuki"
-        private const val WRITE_RETRY_DELAY_MS = 20L
-        private const val MAX_PENDING_WRITES = 256
     }
 }

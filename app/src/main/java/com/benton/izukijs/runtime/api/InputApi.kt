@@ -7,11 +7,15 @@ import com.benton.izukijs.controller.DeviceController
 import com.benton.izukijs.controller.GesturePoint
 import com.benton.izukijs.controller.GestureStroke
 import com.benton.izukijs.controller.TextInputMethod
+import com.benton.izukijs.controller.hid.HidBatchReceipt
+import com.benton.izukijs.controller.hid.HidBatchStatus
+import com.benton.izukijs.controller.hid.HidController
 import com.benton.izukijs.model.Capability
 import com.benton.izukijs.model.ControlMode
 import com.benton.izukijs.core.log.LogBus
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 /**
  * 输入 API：click / swipe / gesture / press / back / home / recents / input。
@@ -23,6 +27,83 @@ class InputApi(
     private val controllers: ControllerManager,
     private val logBus: LogBus,
 ) {
+
+    // Bind this API instance to the actual provider used for tracked submissions.
+    // HidManager unregisters it while disconnected; receipt queries must not
+    // re-resolve a ready controller or consult a shared "last command" variable.
+    @Volatile private var retainedHid: HidController? = null
+    private val localRejections = LinkedHashMap<String, HidBatchReceipt>()
+
+    @Synchronized private fun trackedHid(): HidController? {
+        if (retainedHid == null) retainedHid = controllers.all().filterIsInstance<HidController>().firstOrNull()
+        return retainedHid
+    }
+
+    private fun rejectedHid(reason: String): HidBatchReceipt = synchronized(localRejections) {
+        val receipt = HidBatchReceipt("rejected:${UUID.randomUUID()}", 0, HidBatchStatus.REJECTED, 0, reason = reason)
+        localRejections[receipt.id] = receipt
+        while (localRejections.size > 128) localRejections.remove(localRejections.keys.first())
+        receipt
+    }
+
+    private fun trackedSubmission(action: (HidController) -> HidBatchReceipt): String {
+        val controller = trackedHid()
+        val receipt = when {
+            controllers.isDisabled(ControlMode.HID) -> rejectedHid("hid_disabled")
+            controller == null -> rejectedHid("hid_provider_unavailable")
+            else -> action(controller)
+        }
+        return receiptJson(receipt.id, receipt)
+    }
+
+    private fun Double.hidInteger(maximum: Int = 65535): Int? =
+        if (isFinite() && this >= 0 && this <= maximum && this == kotlin.math.floor(this)) toInt() else null
+
+    /** JSON string: only transport admission/completion. Use JSON.parse in scripts. */
+    @JavascriptInterface
+    fun hidSubmitTap(x: Double, y: Double, durationMillis: Double): String = trackedSubmission { hid ->
+        val ix = x.hidInteger(); val iy = y.hidInteger(); val duration = durationMillis.hidInteger()
+        if (ix == null || iy == null || duration == null) hid.rejectSubmission("invalid_tap")
+        else hid.submitTap(ix, iy, duration)
+    }
+
+    @JavascriptInterface
+    fun hidSubmitSwipe(x1: Double, y1: Double, x2: Double, y2: Double, durationMillis: Double): String = trackedSubmission { hid ->
+        val a = x1.hidInteger(); val b = y1.hidInteger(); val c = x2.hidInteger(); val d = y2.hidInteger()
+        val duration = durationMillis.hidInteger()
+        if (a == null || b == null || c == null || d == null || duration == null) hid.rejectSubmission("invalid_swipe")
+        else hid.submitSwipe(a, b, c, d, duration)
+    }
+
+    @JavascriptInterface
+    fun hidSubmitKey(keyCode: Double): String = trackedSubmission { hid ->
+        keyCode.hidInteger(Int.MAX_VALUE)?.let(hid::submitKey) ?: hid.rejectSubmission("invalid_key")
+    }
+
+    @JavascriptInterface
+    fun hidSubmitText(text: String): String = trackedSubmission { it.submitText(text) }
+
+    @JavascriptInterface
+    fun hidReceipt(id: String): String {
+        val local = synchronized(localRejections) { localRejections[id] }
+        return receiptJson(id, local ?: retainedHid?.receipt(id))
+    }
+
+    private fun receiptJson(id: String, receipt: HidBatchReceipt?): String = JSONObject().apply {
+        put("id", id)
+        put("channel", "HID")
+        put("scope", "GATT_TRANSPORT_ONLY")
+        put("status", receipt?.status?.name ?: "UNKNOWN")
+        put("session", receipt?.session ?: JSONObject.NULL)
+        put("frameCount", receipt?.frameCount ?: JSONObject.NULL)
+        put("transportCompletedFrames", receipt?.transportCompletedFrames ?: JSONObject.NULL)
+        put("transportStartedFrames", receipt?.transportStartedFrames ?: JSONObject.NULL)
+        put("accepted", receipt?.accepted ?: JSONObject.NULL)
+        put("terminal", receipt?.terminal ?: true)
+        put("executionConfirmed", false)
+        put("executionUncertain", receipt?.executionUncertain ?: true)
+        put("reason", receipt?.reason ?: if (receipt == null) "unknown_or_evicted_receipt" else JSONObject.NULL)
+    }.toString()
 
     private fun gestureController(): DeviceController? =
         controllers.controllerFor(Capability.GESTURE)
@@ -265,7 +346,8 @@ class InputApi(
     private fun DeviceController?.resultTag(ok: Boolean): String {
         val mode: ControlMode? = this?.mode
         val target = mode?.displayName ?: "无可用后端"
-        return " → $target ${if (ok) "✓" else "✗"}"
+        return if (ok && mode == ControlMode.HID) " → $target 已入队（未确认执行）"
+            else " → $target ${if (ok) "✓" else "✗"}"
     }
 
     private fun String.preview(max: Int = 80): String =
