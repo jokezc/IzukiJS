@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayInputStream
 
 class SubscriptionSyncTest {
 
@@ -22,10 +23,25 @@ class SubscriptionSyncTest {
     }
 
     @Test
-    fun zeroIntervalMeansDisabled() {
+    fun zeroIntervalDisablesAutomaticScheduling() {
         assertEquals(0L, SubscriptionSync.normalizeInterval(0L))
         assertTrue(SubscriptionSync.isDisabled(0L))
         assertFalse(SubscriptionSync.isDisabled(SubscriptionSync.MIN_INTERVAL_MINUTES))
+    }
+
+    @Test
+    fun manualOnlySubscriptionCanStillSyncManually() {
+        val subscription = ScriptSubscription("id", "https://example.com/a.js", 0, enabled = false)
+        assertTrue(SubscriptionSync.canSync(subscription, automatic = false, now = 100))
+        assertFalse(SubscriptionSync.canSync(subscription, automatic = true, now = 100))
+    }
+
+    @Test
+    fun automaticWorkMustStillBeEnabledAndDueAfterQueueing() {
+        val due = ScriptSubscription("id", "https://example.com/a.js", 15, nextSyncAtMillis = 100)
+        assertTrue(SubscriptionSync.canSync(due, automatic = true, now = 100))
+        assertFalse(SubscriptionSync.canSync(due.copy(enabled = false), automatic = true, now = 100))
+        assertFalse(SubscriptionSync.canSync(due.copy(nextSyncAtMillis = 200), automatic = true, now = 100))
     }
 
     @Test
@@ -47,9 +63,67 @@ class SubscriptionSyncTest {
     }
 
     @Test
-    fun changedRemoteIsOverwritten() {
+    fun changedRemoteUpdatesOnlyUnmodifiedLocalBaseline() {
         val previous = SubscriptionSync.sha256("old remote")
-        assertTrue(SubscriptionSync.shouldOverwrite("local edit", "new remote", previous))
-        assertTrue(SubscriptionSync.shouldOverwrite("local edit", "new remote", ""))
+        assertTrue(SubscriptionSync.shouldOverwrite("old remote", "new remote", previous))
+        assertEquals(SubscriptionSync.UpdateDecision.CONFLICT,
+            SubscriptionSync.updateDecision("local edit", "new remote", previous))
+        assertFalse(SubscriptionSync.shouldOverwrite("local edit", "new remote", previous))
+    }
+
+    @Test
+    fun firstSyncDoesNotOverwriteUnknownLocalHistory() {
+        assertEquals(SubscriptionSync.UpdateDecision.CONFLICT,
+            SubscriptionSync.updateDecision("local", "remote", ""))
+        assertEquals(SubscriptionSync.UpdateDecision.UNCHANGED,
+            SubscriptionSync.updateDecision("same", "same", ""))
+    }
+
+    @Test
+    fun localEditsSurviveUnchangedRemote() {
+        assertEquals(SubscriptionSync.UpdateDecision.UNCHANGED,
+            SubscriptionSync.updateDecision("local edit", "remote", SubscriptionSync.sha256("remote")))
+    }
+
+    @Test
+    fun scriptDownloadAcceptsExactByteLimitAndUtf8() {
+        val text = "你好"
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        assertEquals(text, SubscriptionSync.readScript(ByteArrayInputStream(bytes), bytes.size))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun scriptDownloadRejectsOversizedBodyWithoutContentLength() {
+        SubscriptionSync.readScript(ByteArrayInputStream(ByteArray(17)), 16)
+    }
+
+    @Test
+    fun updatedSettingsPreserveLatestSyncMetadataForSameUrl() {
+        val latest = ScriptSubscription("id", "https://example.com/a.js", 60,
+            contentHash = "latest-hash", etag = "latest-etag", lastSyncAtMillis = 42)
+        val stale = latest.copy(enabled = false, intervalMinutes = 0, contentHash = "stale", etag = "stale")
+        val result = SubscriptionSync.applySettings(stale, latest)
+        assertFalse(result.enabled)
+        assertEquals(0L, result.intervalMinutes)
+        assertEquals("latest-hash", result.contentHash)
+        assertEquals("latest-etag", result.etag)
+    }
+
+    @Test
+    fun changedUrlClearsOldConditionalHeadersAndBaseline() {
+        val previous = ScriptSubscription("id", "https://example.com/a.js", 60,
+            contentHash = "old-hash", etag = "old-etag", lastModified = "old-date", lastError = "old")
+        val result = SubscriptionSync.applySettings(previous.copy(url = "https://example.com/b.js"), previous)
+        assertEquals("", result.contentHash)
+        assertEquals("", result.etag)
+        assertEquals("", result.lastModified)
+        assertEquals("", result.lastError)
+    }
+
+    @Test
+    fun newSubscriptionDoesNotTrustIncomingBaseline() {
+        val incoming = ScriptSubscription("id", "https://example.com/a.js", 0,
+            contentHash = "unverified", etag = "unverified")
+        assertEquals("", SubscriptionSync.applySettings(incoming, null).contentHash)
     }
 }

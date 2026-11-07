@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import com.benton.izukijs.data.ScriptRepository
 import com.benton.izukijs.core.log.LogBus
@@ -37,7 +38,7 @@ class SubscriptionManager(
         } else {
             0L
         }
-        val updated = subscription.copy(
+        val updated = SubscriptionSync.applySettings(subscription, repository.get(subscription.scriptId)).copy(
             url = subscription.url.trim(),
             intervalMinutes = interval,
             enabled = enabled,
@@ -82,16 +83,21 @@ class SubscriptionManager(
     }
 
     fun onAlarm(scriptId: String) {
-        scope.launch {
-            val subscription = repository.get(scriptId) ?: return@launch
-            if (!subscription.enabled) return@launch
-            sync(subscription)
+        // The broadcast only schedules durable work; network IO outlives onReceive.
+        runCatching { SubscriptionJobService.enqueue(appContext) }.onFailure {
+            logBus.warn("订阅后台任务调度失败，稍后重试: $scriptId")
+            setAlarm(scriptId, System.currentTimeMillis() + SubscriptionSync.MIN_INTERVAL_MINUTES * 60_000L)
         }
     }
 
+    suspend fun syncDue() = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        repository.list().filter { SubscriptionSync.canSync(it, automatic = true, now = now) }
+            .forEach { sync(it.scriptId, automatic = true) }
+    }
+
     suspend fun syncNow(scriptId: String): Boolean = withContext(Dispatchers.IO) {
-        val subscription = repository.get(scriptId) ?: return@withContext false
-        sync(subscription)
+        sync(scriptId, automatic = false)
     }
 
     fun syncNowAsync(scriptId: String, onFinished: (Boolean) -> Unit = {}) {
@@ -116,20 +122,15 @@ class SubscriptionManager(
         }
     }
 
-    private suspend fun sync(subscription: ScriptSubscription): Boolean = syncMutex.withLock {
+    private suspend fun sync(scriptId: String, automatic: Boolean): Boolean = syncMutex.withLock {
+        // Re-read after waiting for the lock: settings may have changed while queued.
+        val subscription = repository.get(scriptId) ?: return@withLock false
+        val interval = SubscriptionSync.normalizeInterval(subscription.intervalMinutes)
+        if (!SubscriptionSync.canSync(subscription, automatic, System.currentTimeMillis())) return@withLock false
         val script = scriptRepository.find(subscription.scriptId)
         if (script == null) {
             logBus.warn("订阅对应的脚本不存在，已移除订阅: ${subscription.scriptId}")
             cancel(subscription.scriptId)
-            return@withLock false
-        }
-
-        val interval = SubscriptionSync.normalizeInterval(subscription.intervalMinutes)
-        if (SubscriptionSync.isDisabled(interval)) {
-            repository.upsert(
-                subscription.copy(intervalMinutes = 0L, enabled = false, nextSyncAtMillis = 0L),
-            )
-            cancelAlarm(subscription.scriptId)
             return@withLock false
         }
 
@@ -138,24 +139,47 @@ class SubscriptionManager(
         val next = now + interval * 60_000L
         val base = subscription.copy(intervalMinutes = interval, nextSyncAtMillis = next)
 
+        var successful = false
         val updated = when (result) {
-            FetchResult.NotModified -> base.copy(lastSyncAtMillis = now, lastError = "")
+            FetchResult.NotModified -> {
+                successful = true
+                base.copy(lastSyncAtMillis = now, lastError = "")
+            }
 
             is FetchResult.Success -> {
                 val local = scriptRepository.read(script)
-                if (SubscriptionSync.shouldOverwrite(local, result.body, subscription.contentHash)) {
-                    scriptRepository.write(script, result.body)
-                    logBus.info("订阅已更新: ${script.name}")
-                } else {
-                    logBus.info("订阅内容无变化: ${script.name}")
+                val decision = SubscriptionSync.updateDecision(local, result.body, subscription.contentHash)
+                when (decision) {
+                    SubscriptionSync.UpdateDecision.CONFLICT -> {
+                        val message = "订阅冲突：本地脚本与远端均有差异，已保留本地；请先备份并手动核对合并"
+                        logBus.warn("${script.name}: $message")
+                        base.copy(lastError = message)
+                    }
+
+                    SubscriptionSync.UpdateDecision.OVERWRITE -> {
+                        if (scriptRepository.writeIfUnchanged(script, result.body, local)) {
+                            logBus.info("订阅已更新: ${script.name}")
+                            successful = true
+                            base.copy(
+                                lastSyncAtMillis = now,
+                                lastError = "",
+                                contentHash = SubscriptionSync.sha256(result.body),
+                                etag = result.etag,
+                                lastModified = result.lastModified,
+                            )
+                        } else {
+                            val message = "订阅跳过覆盖：脚本在同步期间被修改，已保留本地；请确认后手动同步"
+                            logBus.warn("${script.name}: $message")
+                            base.copy(lastSyncAtMillis = now, lastError = message)
+                        }
+                    }
+
+                    SubscriptionSync.UpdateDecision.UNCHANGED -> {
+                        logBus.info("订阅内容无变化: ${script.name}")
+                        successful = true
+                        base.copy(lastSyncAtMillis = now, lastError = "")
+                    }
                 }
-                base.copy(
-                    lastSyncAtMillis = now,
-                    lastError = "",
-                    contentHash = SubscriptionSync.sha256(result.body),
-                    etag = result.etag,
-                    lastModified = result.lastModified,
-                )
             }
 
             is FetchResult.Failure -> {
@@ -176,7 +200,7 @@ class SubscriptionManager(
         } else {
             cancelAlarm(finalSubscription.scriptId)
         }
-        result is FetchResult.Success || result == FetchResult.NotModified
+        successful
     }
 
     private suspend fun fetch(subscription: ScriptSubscription): FetchResult =
@@ -206,7 +230,10 @@ class SubscriptionManager(
                     when (val code = connection.responseCode) {
                         HttpURLConnection.HTTP_NOT_MODIFIED -> FetchResult.NotModified
                         in 200..299 -> {
-                            val body = connection.inputStream.bufferedReader().use { it.readText() }
+                            require(connection.contentLengthLong <= SubscriptionSync.MAX_SCRIPT_BYTES) {
+                                "订阅脚本超过大小上限（${SubscriptionSync.MAX_SCRIPT_BYTES} bytes）"
+                            }
+                            val body = connection.inputStream.use { SubscriptionSync.readScript(it) }
                             if (body.isBlank()) {
                                 FetchResult.Failure("下载内容为空")
                             } else {
@@ -250,6 +277,8 @@ class SubscriptionManager(
     private fun pendingIntent(scriptId: String): PendingIntent {
         val intent = Intent(appContext, SubscriptionReceiver::class.java).apply {
             action = SubscriptionReceiver.ACTION_SYNC
+            // Intent extras are not part of PendingIntent identity. URI avoids Aa/BB hash collisions.
+            data = Uri.Builder().scheme("izuki-subscription").authority("sync").appendPath(scriptId).build()
             putExtra(SubscriptionReceiver.EXTRA_ID, scriptId)
         }
         return PendingIntent.getBroadcast(

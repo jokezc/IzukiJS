@@ -178,9 +178,10 @@ fun ScriptEditScreen(scriptId: String, onBack: () -> Unit) {
     val syncReady = subscription != null &&
         !intervalDisabled &&
         url.trim() == subscription?.url?.trim() &&
-        (intervalValue ?: 0L) > 0L &&
         !urlInvalid &&
         !intervalInvalid &&
+        !dirty &&
+        !saving &&
         !syncing &&
         !deleting
 
