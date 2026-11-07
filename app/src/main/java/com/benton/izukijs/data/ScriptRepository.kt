@@ -88,21 +88,6 @@ class ScriptRepository(
         }
     }
 
-    /**
-     * 仅当文件当前内容仍等于 expectedContent 时才写入，读取-比较-写入在锁内一次完成。
-     * 供订阅同步使用：决策基于快照 expectedContent，若期间编辑器已保存新内容则返回 false，
-     * 调用方应跳过本次覆盖，避免吞掉用户的最新修改。
-     */
-    fun writeIfUnchanged(script: ScriptInfo, content: String, expectedContent: String): Boolean =
-        synchronized(fileLock) {
-            val current = runCatching {
-                if (script.file.exists()) script.file.readText() else null
-            }.getOrNull() ?: return false
-            if (current != expectedContent) return false
-            write(script, content)
-            true
-        }
-
     fun delete(script: ScriptInfo) {
         script.file.delete()
         history.deleteFor(script.id)
@@ -130,12 +115,6 @@ class ScriptRepository(
 
     suspend fun writeAsync(script: ScriptInfo, content: String, forceHistory: Boolean = false) =
         withContext(Dispatchers.IO) { write(script, content, forceHistory) }
-
-    suspend fun writeIfUnchangedAsync(
-        script: ScriptInfo,
-        content: String,
-        expectedContent: String,
-    ): Boolean = withContext(Dispatchers.IO) { writeIfUnchanged(script, content, expectedContent) }
 
     suspend fun deleteAsync(script: ScriptInfo) = withContext(Dispatchers.IO) { delete(script) }
 

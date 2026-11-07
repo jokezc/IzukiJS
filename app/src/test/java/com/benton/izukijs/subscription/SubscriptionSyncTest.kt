@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.IOException
 
 class SubscriptionSyncTest {
 
@@ -63,26 +64,16 @@ class SubscriptionSyncTest {
     }
 
     @Test
-    fun changedRemoteUpdatesOnlyUnmodifiedLocalBaseline() {
+    fun changedRemoteOverwritesLocalEdits() {
         val previous = SubscriptionSync.sha256("old remote")
         assertTrue(SubscriptionSync.shouldOverwrite("old remote", "new remote", previous))
-        assertEquals(SubscriptionSync.UpdateDecision.CONFLICT,
-            SubscriptionSync.updateDecision("local edit", "new remote", previous))
-        assertFalse(SubscriptionSync.shouldOverwrite("local edit", "new remote", previous))
+        assertTrue(SubscriptionSync.shouldOverwrite("local edit", "new remote", previous))
+        assertTrue(SubscriptionSync.shouldOverwrite("local", "remote", ""))
     }
 
     @Test
-    fun firstSyncDoesNotOverwriteUnknownLocalHistory() {
-        assertEquals(SubscriptionSync.UpdateDecision.CONFLICT,
-            SubscriptionSync.updateDecision("local", "remote", ""))
-        assertEquals(SubscriptionSync.UpdateDecision.UNCHANGED,
-            SubscriptionSync.updateDecision("same", "same", ""))
-    }
-
-    @Test
-    fun localEditsSurviveUnchangedRemote() {
-        assertEquals(SubscriptionSync.UpdateDecision.UNCHANGED,
-            SubscriptionSync.updateDecision("local edit", "remote", SubscriptionSync.sha256("remote")))
+    fun firstSyncAcceptsRemoteContent() {
+        assertTrue(SubscriptionSync.shouldOverwrite("", "remote", ""))
     }
 
     @Test
@@ -92,7 +83,7 @@ class SubscriptionSyncTest {
         assertEquals(text, SubscriptionSync.readScript(ByteArrayInputStream(bytes), bytes.size))
     }
 
-    @Test(expected = IllegalArgumentException::class)
+    @Test(expected = IOException::class)
     fun scriptDownloadRejectsOversizedBodyWithoutContentLength() {
         SubscriptionSync.readScript(ByteArrayInputStream(ByteArray(17)), 16)
     }

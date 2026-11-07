@@ -139,47 +139,24 @@ class SubscriptionManager(
         val next = now + interval * 60_000L
         val base = subscription.copy(intervalMinutes = interval, nextSyncAtMillis = next)
 
-        var successful = false
         val updated = when (result) {
-            FetchResult.NotModified -> {
-                successful = true
-                base.copy(lastSyncAtMillis = now, lastError = "")
-            }
+            FetchResult.NotModified -> base.copy(lastSyncAtMillis = now, lastError = "")
 
             is FetchResult.Success -> {
                 val local = scriptRepository.read(script)
-                val decision = SubscriptionSync.updateDecision(local, result.body, subscription.contentHash)
-                when (decision) {
-                    SubscriptionSync.UpdateDecision.CONFLICT -> {
-                        val message = "订阅冲突：本地脚本与远端均有差异，已保留本地；请先备份并手动核对合并"
-                        logBus.warn("${script.name}: $message")
-                        base.copy(lastError = message)
-                    }
-
-                    SubscriptionSync.UpdateDecision.OVERWRITE -> {
-                        if (scriptRepository.writeIfUnchanged(script, result.body, local)) {
-                            logBus.info("订阅已更新: ${script.name}")
-                            successful = true
-                            base.copy(
-                                lastSyncAtMillis = now,
-                                lastError = "",
-                                contentHash = SubscriptionSync.sha256(result.body),
-                                etag = result.etag,
-                                lastModified = result.lastModified,
-                            )
-                        } else {
-                            val message = "订阅跳过覆盖：脚本在同步期间被修改，已保留本地；请确认后手动同步"
-                            logBus.warn("${script.name}: $message")
-                            base.copy(lastSyncAtMillis = now, lastError = message)
-                        }
-                    }
-
-                    SubscriptionSync.UpdateDecision.UNCHANGED -> {
-                        logBus.info("订阅内容无变化: ${script.name}")
-                        successful = true
-                        base.copy(lastSyncAtMillis = now, lastError = "")
-                    }
+                if (SubscriptionSync.shouldOverwrite(local, result.body, subscription.contentHash)) {
+                    scriptRepository.write(script, result.body)
+                    logBus.info("订阅已更新: ${script.name}")
+                } else {
+                    logBus.info("订阅内容无变化: ${script.name}")
                 }
+                base.copy(
+                    lastSyncAtMillis = now,
+                    lastError = "",
+                    contentHash = SubscriptionSync.sha256(result.body),
+                    etag = result.etag,
+                    lastModified = result.lastModified,
+                )
             }
 
             is FetchResult.Failure -> {
@@ -200,7 +177,7 @@ class SubscriptionManager(
         } else {
             cancelAlarm(finalSubscription.scriptId)
         }
-        successful
+        result is FetchResult.Success || result == FetchResult.NotModified
     }
 
     private suspend fun fetch(subscription: ScriptSubscription): FetchResult =
@@ -230,9 +207,6 @@ class SubscriptionManager(
                     when (val code = connection.responseCode) {
                         HttpURLConnection.HTTP_NOT_MODIFIED -> FetchResult.NotModified
                         in 200..299 -> {
-                            require(connection.contentLengthLong <= SubscriptionSync.MAX_SCRIPT_BYTES) {
-                                "订阅脚本超过大小上限（${SubscriptionSync.MAX_SCRIPT_BYTES} bytes）"
-                            }
                             val body = connection.inputStream.use { SubscriptionSync.readScript(it) }
                             if (body.isBlank()) {
                                 FetchResult.Failure("下载内容为空")

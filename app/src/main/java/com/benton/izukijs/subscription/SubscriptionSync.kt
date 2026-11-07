@@ -1,17 +1,18 @@
 package com.benton.izukijs.subscription
 
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.net.URL
 import java.security.MessageDigest
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 
 object SubscriptionSync {
 
     const val MIN_INTERVAL_MINUTES = 15L
     const val DEFAULT_INTERVAL_MINUTES = 24L * 60L
-    const val MAX_SCRIPT_BYTES = 1024 * 1024
 
-    enum class UpdateDecision { UNCHANGED, OVERWRITE, CONFLICT }
+    /** 单个订阅脚本的下载上限，防止异常链接或错误配置把整段内容读进内存。 */
+    const val MAX_SCRIPT_BYTES = 1024 * 1024
 
     /** 订阅与扫码导入都只接受带主机的 http/https 链接。 */
     fun isHttpUrl(raw: String): Boolean = runCatching {
@@ -36,32 +37,34 @@ object SubscriptionSync {
         .digest(text.toByteArray(Charsets.UTF_8))
         .joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
 
-    fun updateDecision(localContent: String, remoteContent: String, lastHash: String): UpdateDecision {
-        if (remoteContent == localContent) return UpdateDecision.UNCHANGED
+    /**
+     * 远端内容与上次同步记录不同就覆盖本地，本地改动不参与判断——订阅以远端为准。
+     */
+    fun shouldOverwrite(localContent: String, remoteContent: String, lastHash: String): Boolean {
+        if (remoteContent == localContent) return false
         val remoteHash = sha256(remoteContent)
-        if (lastHash.isNotBlank() && remoteHash == lastHash) return UpdateDecision.UNCHANGED
-        if (lastHash.isBlank() || sha256(localContent) != lastHash) return UpdateDecision.CONFLICT
-        return UpdateDecision.OVERWRITE
+        if (lastHash.isNotBlank() && remoteHash == lastHash) return false
+        return true
     }
 
-    fun shouldOverwrite(localContent: String, remoteContent: String, lastHash: String): Boolean =
-        updateDecision(localContent, remoteContent, lastHash) == UpdateDecision.OVERWRITE
-
-    /** Bound bytes even when Content-Length is absent, incorrect, or chunked. */
+    /**
+     * 按块读取响应体，累计超过 [limit] 立刻中止。
+     *
+     * 不用 Content-Length 判断：它可能缺失、被压缩后失真，或因为 chunked 编码而不可知。
+     */
     fun readScript(input: InputStream, limit: Int = MAX_SCRIPT_BYTES): String {
-        require(limit > 0)
-        val output = ByteArrayOutputStream(minOf(limit, 8192))
+        require(limit > 0) { "上限必须为正数" }
         val buffer = ByteArray(8192)
+        val output = ByteArrayOutputStream(minOf(limit, 8192))
         var total = 0
         while (true) {
-            val count = input.read(buffer, 0, minOf(buffer.size, limit - total + 1))
+            val count = input.read(buffer)
             if (count < 0) break
-            if (count == 0) continue
             total += count
-            require(total <= limit) { "订阅脚本超过大小上限（$limit bytes）" }
+            if (total > limit) throw IOException("订阅脚本超过大小上限（$limit 字节）")
             output.write(buffer, 0, count)
         }
-        return output.toString(Charsets.UTF_8.name())
+        return output.toString("UTF-8")
     }
 
     /** UI settings may have been prepared before a queued sync completed. */
